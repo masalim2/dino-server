@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dino-server"
+version = "0.1.0"
+description = "Always-on DINOv3 segmentation inference server (HTTP, filesystem-path in/out)"
+readme = "README.md"
+requires-python = ">=3.11"
+
+dependencies = [
+    "lightly-train==0.13.2",
+    "torch==2.9.1",
+    "torchvision==0.24.1",
+    "numpy==2.2.6",
+    "pytorch-lightning==2.6.0",
+    "pillow",
+    "fastapi",
+    "uvicorn",
+    "pydantic>=2",
+    "globus-compute-sdk",
+    "requests",
+]
+
+[project.scripts]
+dino-server = "dino_server.server:main"
+
+[tool.setuptools]
+packages = ["dino_server"]
