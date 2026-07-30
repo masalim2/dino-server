@@ -54,6 +54,8 @@ def submit(payload: Payload):
             return resp.json()
         except requests.RequestException as e:
             last_error[base] = str(e)
+            if isinstance(e, requests.HTTPError):
+                last_error[base] += f" (Response: {e.response.text[:300]})"
             continue
 
 
@@ -66,6 +68,8 @@ def submit(payload: Payload):
             return resp.json()
         except requests.RequestException as e:
             last_error[base] = str(e)
+            if isinstance(e, requests.HTTPError):
+                last_error[base] += f" (Response: {e.response.text[:300]})"
             continue
 
 
@@ -74,6 +78,7 @@ def submit(payload: Payload):
     )
 
 
-gcc = Client()
-func_uuid = gcc.register_function(submit)
-print(f"Registered {submit.__name__}: {func_uuid=}")
+if __name__ == "__main__":
+    gcc = Client()
+    func_uuid = gcc.register_function(submit)
+    print(f"Registered {submit.__name__}: {func_uuid=}")

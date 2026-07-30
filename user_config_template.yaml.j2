@@ -36,7 +36,7 @@ engine:
       source /eagle/inference_service/misha/dino-server/.venv/bin/activate
 
       CHECKPOINT="/eagle/inference_service/misha/dino-server/checkpoints/best.ckpt"
-      LOG_DIR="/eagle/inference_service/dino-server-workdir/logs"
+      LOG_DIR="/eagle/inference_service/misha/dino-server/logs"
       mkdir -p "$LOG_DIR"
 
       PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \

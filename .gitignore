@@ -1,0 +1,5 @@
+logs/
+checkpoints/
+__pycache__/
+dino_server.egg-info/
+dino_server/__pycache__/
