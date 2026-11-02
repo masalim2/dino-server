@@ -8,43 +8,30 @@ in a POST body.
 An external coordinator is expected to stage data in/out of the paths; this layer
 only keeps the model hot and runs inference.
 
-The server does not take a fixed port: on startup it grabs an OS-assigned free
-port and publishes a ``<pid>.json`` record under a well-known directory
-(``/eagle/inference_service/.dino_server_registry`` by default). This lets Globus Compute drop one server per
-GPU onto a node with no port coordination, and lets client functions discover the
-live servers via ``dino_server.registry.discover_servers()``. See that module for
-the race-safety rationale.
-
 Run (single GPU, resident):
     CUDA_VISIBLE_DEVICES=0 dino-server \
-        --host 0.0.0.0 \
+        --uds /tmp/dino.sock \
         --default-checkpoint /path/to/best.ckpt
 
-    # equivalently:
-    CUDA_VISIBLE_DEVICES=0 python -m dino_server.server --default-checkpoint ...
-
-Request (port is discovered, not fixed):
-    curl -s http://localhost:$PORT/infer -H 'Content-Type: application/json' -d '{
-        "input_dir":  "/scratch/job123/in",
-        "output_dir": "/scratch/job123/out",
+Request (the FIRST gateway authenticates the caller and sets X-First-User-Id):
+    curl -s --unix-socket /tmp/dino.sock http://localhost/v1/segmentation \
+        -H 'Content-Type: application/json' -H 'X-First-User-Id: <id>' -d '{
+        "input_dir":  "/eagle/.../user-staging/<id>/job123",
         "project":    "moon",
         "save_overlay": true
     }' | jq
 """
 import argparse
-import atexit
-import os
-import signal
 import threading
 import time
 from pathlib import Path
-from typing import Optional, Any
+from typing import Annotated, Optional, Any
 
 import numpy as np
 import torch
 from PIL import Image
 from pydantic import BaseModel
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException
 from torch.utils.data import DataLoader
 
 import lightly_train
@@ -57,7 +44,6 @@ from .inference import (
     mask_to_color,
     normalize_image_percentile,
 )
-from . import registry
 
 # ------------------------
 # Hot model cache
@@ -67,7 +53,7 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 _model_cache: dict[str, object] = {}
 _cache_lock = threading.Lock()
 # Serialize GPU work: one model, one CUDA context -> concurrent forward passes
-# would just contend. The coordinator can fan out across multiple server copies.
+# would just contend. Scale by running more replicas.
 _infer_lock = threading.Lock()
 
 
@@ -91,7 +77,6 @@ def get_model(checkpoint: str):
 # ------------------------
 class InferRequest(BaseModel):
     input_dir: str
-    output_dir: str
     project: str = "synaps-I"
     checkpoint: Optional[str] = None  # falls back to server default
     save_overlay: bool = False
@@ -112,7 +97,8 @@ class InferResponse(BaseModel):
 # ------------------------
 app = FastAPI(title="DINOv3 inference server")
 DEFAULT_CHECKPOINT: Optional[str] = None
-busy = False
+# Results land beside the input, where the user can read them back through Globus.
+OUTPUT_DIR_SUFFIX = ".dinov3.output"
 
 @app.get("/health")
 def health():
@@ -122,8 +108,8 @@ def health():
         "loaded_checkpoints": list(_model_cache.keys()),
         "default_checkpoint": DEFAULT_CHECKPOINT,
         "projects": list(PROJECTS.keys()),
-        "busy": busy,
     }
+
 
 def _infer(req: InferRequest, model: Any, dataset: ImageDataset, mask_dir: Path, overlay_dir: Path):
     class_colors = PROJECTS[req.project]["colors"]
@@ -154,20 +140,37 @@ def _infer(req: InferRequest, model: Any, dataset: ImageDataset, mask_dir: Path,
                     overlay = (0.6 * img_norm + 0.4 * color_mask).astype(np.uint8)
                     Image.fromarray(overlay).save(overlay_dir / img_name)
 
-@app.post("/infer", response_model=InferResponse)
-def infer(req: InferRequest):
-    global busy
+
+def resolve_input_dir(input_dir: str, user_id: str) -> Path:
+    """Confine input_dir, and the output beside it, to the caller's staging area."""
+    staging_segment = f"/user-staging/{user_id}/"
+    resolved = str(Path(input_dir).resolve())
+    marker = resolved.find(staging_segment)
+    if marker == -1 or not resolved[marker + len(staging_segment):]:
+        raise HTTPException(
+            400,
+            f"input_dir must be a subdirectory of your staging area "
+            f"({staging_segment}); got: {input_dir!r}",
+        )
+    return Path(resolved)
+
+
+@app.post("/v1/segmentation", response_model=InferResponse)
+def segmentation(
+    req: InferRequest,
+    x_first_user_id: Annotated[str, Header()],
+):
     checkpoint = req.checkpoint or DEFAULT_CHECKPOINT
     if checkpoint is None:
         raise HTTPException(400, "No checkpoint given and no --default-checkpoint set")
     if req.project not in PROJECTS:
         raise HTTPException(400, f"Unknown project '{req.project}'; choices: {list(PROJECTS)}")
 
-    input_dir = Path(req.input_dir)
+    input_dir = resolve_input_dir(req.input_dir, x_first_user_id)
     if not input_dir.is_dir():
         raise HTTPException(400, f"input_dir does not exist: {input_dir}")
 
-    output_dir = Path(req.output_dir)
+    output_dir = input_dir.with_name(input_dir.name + OUTPUT_DIR_SUFFIX)
     mask_dir = output_dir / "semantic_masks"
     overlay_dir = output_dir / "semantic_masks_overlay"
     mask_dir.mkdir(parents=True, exist_ok=True)
@@ -179,13 +182,8 @@ def infer(req: InferRequest):
     if len(dataset) == 0:
         raise HTTPException(400, f"No images found in {input_dir}")
 
-
     t0 = time.time()
-    busy = True
-    try:
-        _infer(req, model, dataset, mask_dir, overlay_dir)
-    finally:
-        busy = False
+    _infer(req, model, dataset, mask_dir, overlay_dir)
 
     return InferResponse(
         status="ok",
@@ -199,55 +197,20 @@ def infer(req: InferRequest):
 def main():
     global DEFAULT_CHECKPOINT
     parser = argparse.ArgumentParser(description="Always-on DINOv3 inference server")
-    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--uds", required=True, help="Unix domain socket to listen on")
     parser.add_argument("--default-checkpoint", type=str, default=None,
                         help="Checkpoint to preload and use when a request omits one")
     args = parser.parse_args()
 
     DEFAULT_CHECKPOINT = args.default_checkpoint
 
-    # Grab a free port *before* the slow model load, and keep the socket open so no
-    # other server can take the port in the meantime. The OS guarantees the port is
-    # unique across the concurrently-starting servers on this node; see registry.py.
-    sock = registry.reserve_free_socket(args.host)
-    port = registry.port_of(sock)
-    print(f"[serve] reserved port {port} (pid={os.getpid()})", flush=True)
-
     if DEFAULT_CHECKPOINT:
         get_model(DEFAULT_CHECKPOINT)  # warm the model before accepting traffic
 
-    # Publish our record only once we're about to serve. Clean it up on the way
-    # out — atexit covers normal exit; the signal handlers cover SLURM/PBS/GC
-    # sending SIGTERM/SIGINT so we don't leave a stale file behind.
-    record_path = registry.register(
-        port,
-        host=args.host,
-        gpu=os.environ.get("CUDA_VISIBLE_DEVICES"),
-        default_checkpoint=DEFAULT_CHECKPOINT,
-    )
-    print(f"[serve] registered {record_path}", flush=True)
-
-    atexit.register(registry.unregister, record_path)
-
-    def _handle_signal(signum, _frame):
-        registry.unregister(record_path)
-        # Re-raise default behavior so uvicorn/Python shuts down normally.
-        signal.signal(signum, signal.SIG_DFL)
-        os.kill(os.getpid(), signum)
-
-    for sig in (signal.SIGTERM, signal.SIGINT):
-        signal.signal(sig, _handle_signal)
-
     import uvicorn
     # Single worker on purpose: keeps one hot model per process. Scale by
-    # launching more copies on other GPUs, not with --workers. Hand uvicorn the
-    # pre-bound socket so the reserved port passes straight through with no gap.
-    config = uvicorn.Config(app, workers=1, log_level="info")
-    server = uvicorn.Server(config)
-    try:
-        server.run(sockets=[sock])
-    finally:
-        registry.unregister(record_path)
+    # launching more replicas on other GPUs, not with --workers.
+    uvicorn.run(app, uds=args.uds, workers=1, log_level="info")
 
 
 if __name__ == "__main__":

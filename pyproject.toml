@@ -19,8 +19,6 @@ dependencies = [
     "fastapi",
     "uvicorn",
     "pydantic>=2",
-    "globus-compute-sdk",
-    "requests",
 ]
 
 [project.scripts]
