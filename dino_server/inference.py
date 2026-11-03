@@ -6,6 +6,11 @@ project class definitions, the image dataset, batch prediction, and mask
 visualization helpers. No distributed/argparse machinery — the server keeps a
 single model hot on one GPU and drives it over HTTP.
 """
+import io
+import os
+import warnings
+from typing import Sequence
+
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -13,6 +18,8 @@ import torchvision.transforms as transforms
 from pathlib import Path
 from PIL import Image
 from torch.utils.data import Dataset
+
+from . import safe_fs
 
 # ------------------------
 # Project definitions
@@ -106,41 +113,68 @@ def normalize_image_percentile(img_array, lower_percentile=2, upper_percentile=9
 # Dataset class
 # ------------------------
 class ImageDataset(Dataset):
-    def __init__(self, img_dir):
-        self.img_dir = Path(img_dir)
+    """Images directly inside a user-staged directory, read symlink-safely.
 
-        IMG_EXTS = {".png", ".jpg", ".jpeg", ".tif", ".tiff"}
-        self.img_paths = sorted([
-            p for p in self.img_dir.iterdir()
-            if p.suffix.lower() in IMG_EXTS
-        ])
+    The directory is identified by a trusted ``anchor`` path plus the path
+    components below it (see ``safe_fs.open_dir``). Each item re-opens the
+    directory by walking those components rather than holding an fd, so the
+    dataset works with any DataLoader worker start method.
+    """
+
+    IMG_EXTS = {".png", ".jpg", ".jpeg", ".tif", ".tiff"}
+    # Only let PIL try the decoders matching IMG_EXTS, regardless of content.
+    PIL_FORMATS = ("PNG", "JPEG", "TIFF")
+
+    def __init__(self, anchor: str, parts: Sequence[str]):
+        self.anchor = str(anchor)
+        self.parts = tuple(parts)
+        dir_fd = safe_fs.open_dir(self.anchor, self.parts)
+        try:
+            names = safe_fs.list_regular_files(dir_fd)
+        finally:
+            os.close(dir_fd)
+        self.img_names = sorted(
+            n for n in names
+            if not n.startswith(".") and Path(n).suffix.lower() in self.IMG_EXTS
+        )
 
     def __len__(self):
-        return len(self.img_paths)
+        return len(self.img_names)
+
+    def _read(self, name: str) -> bytes:
+        dir_fd = safe_fs.open_dir(self.anchor, self.parts)
+        try:
+            return safe_fs.read_file(dir_fd, name)
+        finally:
+            os.close(dir_fd)
 
     def __getitem__(self, idx):
-        img_path = self.img_paths[idx]
+        img_name = self.img_names[idx]
+        data = self._read(img_name)
 
-        with Image.open(img_path) as img:
-            if img.mode not in ['RGB', 'L', 'RGBA']:
-                if img.mode in ['I', 'I;16', 'F']:
-                    img_array = np.array(img)
-                    img_array = ((img_array - img_array.min()) /
-                                (img_array.max() - img_array.min()) * 255).astype(np.uint8)
-                    img = Image.fromarray(img_array, mode='L')
-                else:
-                    img = img.convert('L')
+        # Treat oversized images as errors rather than warnings.
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(io.BytesIO(data), formats=self.PIL_FORMATS) as img:
+                if img.mode not in ['RGB', 'L', 'RGBA']:
+                    if img.mode in ['I', 'I;16', 'F']:
+                        img_array = np.array(img, dtype=np.float64)
+                        lo, hi = img_array.min(), img_array.max()
+                        scale = 255.0 / (hi - lo) if hi > lo else 0.0
+                        img_array = ((img_array - lo) * scale).astype(np.uint8)
+                        img = Image.fromarray(img_array, mode='L')
+                    else:
+                        img = img.convert('L')
 
-            img = img.convert("RGB")
-            img_np = np.array(img)
+                img = img.convert("RGB")
+                img_np = np.array(img)
 
         img_tensor = transforms.ToTensor()(img)  # [0, 1] range
 
         return {
             'image': img_tensor,
             'image_np': img_np,
-            'img_path': str(img_path),
-            'img_name': img_path.name
+            'img_name': img_name,
         }
 
 

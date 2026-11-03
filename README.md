@@ -10,8 +10,9 @@ area.
   `<input_dir>.dinov3.output/semantic_masks/`.
 - **Parallelism is across directories.** Each server owns one GPU; FIRST runs one
   replica per GPU and routes each directory to a replica.
-- **Multiple checkpoints** can be served from one process — a request may point at
-  a custom fine-tune, which is loaded lazily and then kept hot.
+- **Multiple checkpoints** can be served from one process. They are configured
+  **only at launch** and all preloaded; a request can select one by name but can
+  never supply a checkpoint path.
 
 ## Install
 
@@ -32,9 +33,18 @@ the `sophia/dinov3` LaunchTemplate in gateway-api-fixtures.
 CUDA_VISIBLE_DEVICES=0 dino-server --uds /tmp/dino.sock --default-checkpoint /path/to/best.ckpt
 ```
 
-`--default-checkpoint` is preloaded before the socket is bound, so the first
-request is already warm. It's used by any request that doesn't specify its own
-`checkpoint`.
+All checkpoints are loaded before the socket is bound, so the first request is
+already warm, and nothing is loaded after that.
+
+| Flag | Description |
+| ---- | ----------- |
+| `--default-checkpoint PATH` | Used when a request omits `checkpoint` (also selectable as `"default"`). |
+| `--checkpoint NAME=PATH` | Additional checkpoint a request may select by `NAME`. Repeatable. |
+| `--staging-root DIR` | Optional, recommended. The canonical `.../user-staging` directory; `input_dir` must then be under `DIR/<user id>/`. Without it, any path containing `/user-staging/<user id>/` is accepted. |
+
+At least one checkpoint is required. Checkpoints are pickled code, so the server
+refuses to start if any checkpoint path (before or after resolving symlinks) is
+inside a `user-staging` directory or `--staging-root`.
 
 Check a server's status (device, loaded checkpoints, projects):
 
@@ -74,11 +84,11 @@ print(resp.json())
 #  'elapsed_sec': 12.4}
 ```
 
-### Pointing at a custom fine-tune
+### Selecting a checkpoint
 
-Set `checkpoint` in the request to a checkpoint path. The first request for a new
-checkpoint pays a one-time load cost; after that it stays hot alongside any others
-in the process.
+Set `checkpoint` in the request to the `NAME` of a checkpoint the server was
+launched with (`--checkpoint NAME=PATH`). To serve a new fine-tune, add it to the
+launch configuration and restart the replica. Paths are not accepted.
 
 ## Request fields
 
@@ -86,10 +96,28 @@ in the process.
 | -------------- | ------ | ------------ | ------------------------------------------------------ |
 | `input_dir`    | str    | *(required)* | Directory of images (`.png/.jpg/.jpeg/.tif/.tiff`).    |
 | `project`      | str    | `"synaps-I"` | Class palette/names: `"moon"` or `"synaps-I"`.         |
-| `checkpoint`   | str    | server default | Path to a fine-tuned checkpoint to use.              |
+| `checkpoint`   | str    | `"default"`  | Name of a launch-configured checkpoint (not a path).   |
 | `save_overlay` | bool   | `false`      | Also write overlays to `semantic_masks_overlay/`.      |
-| `batch_size`   | int    | `4`          | Images per forward batch.                              |
-| `num_workers`  | int    | `4`          | DataLoader workers.                                    |
+| `batch_size`   | int    | `4`          | Images per forward batch (1–64).                       |
+| `num_workers`  | int    | `4`          | DataLoader workers (0–16).                             |
+
+Unknown fields are rejected.
+
+## Handling of staged data
+
+Everything under a user's staging directory is treated as untrusted:
+
+- `X-First-User-Id` must be a plain identifier (`[A-Za-z0-9][A-Za-z0-9._@-]*`).
+- `input_dir` is resolved and confined to `/user-staging/<id>/`. All later I/O
+  walks from that directory with `O_NOFOLLOW`, so symlinks swapped in after the
+  check are caught.
+- Only regular, non-hidden, singly-linked image files directly in `input_dir` are
+  read; symlinks and special files are skipped, and a hardlinked image fails the
+  request. Images are decoded only as PNG/JPEG/TIFF, and oversized
+  (decompression-bomb) images are rejected.
+- The output directories must be real directories (not symlinks). Each output
+  file is written to a temp file and renamed into place, so a pre-planted
+  symlink or hardlink at the destination is replaced, never written through.
 
 ## Notes
 
