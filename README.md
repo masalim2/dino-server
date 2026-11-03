@@ -100,6 +100,7 @@ launch configuration and restart the replica. Paths are not accepted.
 | `save_overlay` | bool   | `false`      | Also write overlays to `semantic_masks_overlay/`.      |
 | `batch_size`   | int    | `4`          | Images per forward batch (1–64).                       |
 | `num_workers`  | int    | `4`          | DataLoader workers (0–16).                             |
+| `model`        | str    | —            | Set by the FIRST gateway; accepted and ignored.        |
 
 Unknown fields are rejected.
 

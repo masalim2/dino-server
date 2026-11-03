@@ -108,6 +108,9 @@ def load_checkpoints(checkpoints: dict[str, str]) -> None:
 class InferRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    # The FIRST gateway forwards the catalog model name it routed on. A replica
+    # serves exactly one catalog model, so it is accepted and ignored.
+    model: Optional[str] = None
     input_dir: str
     project: str = "synaps-I"
     # Name of a checkpoint configured at launch (not a path).
